@@ -1,4 +1,5 @@
 #include <GL/glui.h>
+#include <GL/freeglut.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -9,7 +10,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -25,9 +28,21 @@ struct ViewBlock {
   GLuint texture;
   int width;
   int height;
+  std::vector<unsigned char> png;
+  int draw_x;
+  int draw_y;
+  int draw_width;
+  int draw_height;
 };
 std::vector<ViewBlock> view_blocks;
 int view_scroll = 0;
+float view_zoom = 1.0f;
+int view_pan_x = 0;
+bool dragging = false;
+int last_mouse_x = 0;
+int last_mouse_y = 0;
+int hovered_image = -1;
+int context_menu = 0;
 
 void clear_view()
 {
@@ -38,13 +53,16 @@ void clear_view()
   }
   view_blocks.clear();
   view_scroll = 0;
+  view_pan_x = 0;
+  hovered_image = -1;
 }
 
 void append_text_block(const std::string &text)
 {
   if (text.empty())
     return;
-  ViewBlock block = { text, 0, 0, 0 };
+  ViewBlock block = {};
+  block.text = text;
   view_blocks.push_back(block);
 }
 
@@ -114,6 +132,71 @@ GLuint png_texture(const std::vector<unsigned char> &png, int &width, int &heigh
   }
   stream->Release();
   return texture;
+}
+
+bool copy_png_to_clipboard(const std::vector<unsigned char> &png)
+{
+  if (png.empty())
+    return false;
+  IStream *stream = NULL;
+  if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK)
+    return false;
+  ULONG written = 0;
+  stream->Write(&png[0], static_cast<ULONG>(png.size()), &written);
+  LARGE_INTEGER start = { 0 };
+  stream->Seek(start, STREAM_SEEK_SET, NULL);
+  Gdiplus::Bitmap bitmap(stream, FALSE);
+  bool copied = false;
+  if (bitmap.GetLastStatus() == Gdiplus::Ok) {
+    const int width = static_cast<int>(bitmap.GetWidth());
+    const int height = static_cast<int>(bitmap.GetHeight());
+    Gdiplus::Rect bounds(0, 0, width, height);
+    Gdiplus::BitmapData data;
+    if (bitmap.LockBits(&bounds, Gdiplus::ImageLockModeRead,
+                        PixelFormat32bppARGB, &data) == Gdiplus::Ok) {
+      const std::size_t pixel_bytes = static_cast<std::size_t>(width) * height * 4;
+      const std::size_t dib_bytes = sizeof(BITMAPINFOHEADER) + pixel_bytes;
+      HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, dib_bytes);
+      if (memory) {
+        unsigned char *dib = static_cast<unsigned char *>(GlobalLock(memory));
+        if (dib) {
+          BITMAPINFOHEADER header = {};
+          header.biSize = sizeof(BITMAPINFOHEADER);
+          header.biWidth = width;
+          header.biHeight = height;
+          header.biPlanes = 1;
+          header.biBitCount = 32;
+          header.biCompression = BI_RGB;
+          header.biSizeImage = static_cast<DWORD>(pixel_bytes);
+          std::memcpy(dib, &header, sizeof(header));
+          unsigned char *pixels = dib + sizeof(header);
+          for (int row = 0; row < height; ++row) {
+            const unsigned char *source = static_cast<const unsigned char *>(data.Scan0) +
+              row * data.Stride;
+            unsigned char *target = pixels +
+              static_cast<std::size_t>(height - row - 1) * width * 4;
+            for (int col = 0; col < width; ++col) {
+              target[col * 4] = source[col * 4];
+              target[col * 4 + 1] = source[col * 4 + 1];
+              target[col * 4 + 2] = source[col * 4 + 2];
+              target[col * 4 + 3] = 0xff;
+            }
+          }
+          GlobalUnlock(memory);
+          if (OpenClipboard(NULL)) {
+            EmptyClipboard();
+            copied = SetClipboardData(CF_DIB, memory) != NULL;
+            CloseClipboard();
+          }
+        }
+        if (!copied)
+          GlobalFree(memory);
+      }
+      bitmap.UnlockBits(&data);
+    }
+  }
+  stream->Release();
+  return copied;
 }
 #endif
 
@@ -217,7 +300,11 @@ void append_image_block(const std::string &encoded)
   int height = 0;
   const GLuint texture = png_texture(png, width, height);
   if (texture) {
-    ViewBlock block = { std::string(), texture, width, height };
+    ViewBlock block = {};
+    block.texture = texture;
+    block.width = width;
+    block.height = height;
+    block.png = png;
     view_blocks.push_back(block);
   } else {
     append_text_block("[Unable to display rendered Mermaid image]\n");
@@ -367,22 +454,28 @@ void draw_content(int left, int top, int width, int height,
 
   if (view_blocks.empty()) {
     glColor3f(0.35f, 0.35f, 0.35f);
-    glRasterPos2i(content_left, y + 14);
+    glPixelZoom(view_zoom, view_zoom);
+    glRasterPos2i(content_left, y + static_cast<int>(14 * view_zoom));
     const char *message = "Open a Markdown file to view its catmd output.";
     while (*message)
       glutBitmapCharacter(GLUT_BITMAP_8_BY_13, *message++);
+    glPixelZoom(1.0f, 1.0f);
     glDisable(GL_SCISSOR_TEST);
     return;
   }
 
-  for (std::vector<ViewBlock>::const_iterator block = view_blocks.begin();
+  for (std::vector<ViewBlock>::iterator block = view_blocks.begin();
        block != view_blocks.end(); ++block) {
     if (block->texture) {
       const float scale = std::min(
         1.0f, std::min(static_cast<float>(content_width) / block->width,
-                       static_cast<float>(content_height) / block->height));
+                       static_cast<float>(content_height) / block->height)) * view_zoom;
       const int image_width = static_cast<int>(block->width * scale);
       const int image_height = static_cast<int>(block->height * scale);
+      block->draw_x = content_left - view_pan_x;
+      block->draw_y = y;
+      block->draw_width = image_width;
+      block->draw_height = image_height;
       if (y + image_height >= content_top && y < content_top + content_height) {
         glEnable(GL_TEXTURE_2D);
         glEnable(GL_BLEND);
@@ -390,10 +483,10 @@ void draw_content(int left, int top, int width, int height,
         glBindTexture(GL_TEXTURE_2D, block->texture);
         glColor3f(1.0f, 1.0f, 1.0f);
         glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f); glVertex2i(content_left, y);
-        glTexCoord2f(1.0f, 0.0f); glVertex2i(content_left + image_width, y);
-        glTexCoord2f(1.0f, 1.0f); glVertex2i(content_left + image_width, y + image_height);
-        glTexCoord2f(0.0f, 1.0f); glVertex2i(content_left, y + image_height);
+        glTexCoord2f(0.0f, 0.0f); glVertex2i(block->draw_x, y);
+        glTexCoord2f(1.0f, 0.0f); glVertex2i(block->draw_x + image_width, y);
+        glTexCoord2f(1.0f, 1.0f); glVertex2i(block->draw_x + image_width, y + image_height);
+        glTexCoord2f(0.0f, 1.0f); glVertex2i(block->draw_x, y + image_height);
         glEnd();
         glDisable(GL_BLEND);
         glDisable(GL_TEXTURE_2D);
@@ -402,30 +495,35 @@ void draw_content(int left, int top, int width, int height,
       continue;
     }
 
-    int x = content_left;
+    int x = content_left - view_pan_x;
+    const int line_height = std::max(1, static_cast<int>(18 * view_zoom));
+    const int glyph_height = static_cast<int>(13 * view_zoom);
+    glPixelZoom(view_zoom, view_zoom);
     for (std::string::const_iterator ch = block->text.begin(); ch != block->text.end(); ++ch) {
       if (*ch == '\n' || *ch == '\r') {
         if (*ch == '\n') {
-          x = content_left;
-          y += 18;
+          x = content_left - view_pan_x;
+          y += line_height;
         }
         continue;
       }
       if (static_cast<unsigned char>(*ch) >= 0x80)
         continue;
-      const int char_width = glutBitmapWidth(GLUT_BITMAP_8_BY_13,
-        static_cast<unsigned char>(*ch));
+      const int char_width = std::max(1, static_cast<int>(
+        glutBitmapWidth(GLUT_BITMAP_8_BY_13, static_cast<unsigned char>(*ch)) *
+        view_zoom));
       if (x + char_width > content_left + content_width) {
-        x = content_left;
-        y += 18;
+        x = content_left - view_pan_x;
+        y += line_height;
       }
-      if (y + 13 >= content_top && y < content_top + content_height) {
+      if (y + glyph_height >= content_top && y < content_top + content_height) {
         glColor3f(0.12f, 0.12f, 0.12f);
-        glRasterPos2i(x, y + 13);
+        glRasterPos2i(x, y + glyph_height);
         glutBitmapCharacter(GLUT_BITMAP_8_BY_13, static_cast<unsigned char>(*ch));
       }
       x += char_width;
     }
+    glPixelZoom(1.0f, 1.0f);
   }
   glDisable(GL_SCISSOR_TEST);
 }
@@ -478,12 +576,48 @@ void reshape(int, int)
   glutPostRedisplay();
 }
 
+void set_view_zoom(float zoom)
+{
+  const float next_zoom = std::max(0.25f, std::min(4.0f, zoom));
+  if (next_zoom == view_zoom)
+    return;
+  view_scroll = static_cast<int>(view_scroll * next_zoom / view_zoom);
+  view_zoom = next_zoom;
+}
+
+void zoom_in(int)
+{
+  set_view_zoom(view_zoom * 1.2f);
+  glutSetWindow(main_window);
+  glutPostRedisplay();
+}
+
+void zoom_out(int)
+{
+  set_view_zoom(view_zoom / 1.2f);
+  glutSetWindow(main_window);
+  glutPostRedisplay();
+}
+
+void zoom_reset(int)
+{
+  set_view_zoom(1.0f);
+  glutSetWindow(main_window);
+  glutPostRedisplay();
+}
+
 void keyboard(unsigned char key, int, int)
 {
   if (key == 'w' || key == 'W' || key == '[')
     view_scroll = std::max(0, view_scroll - 40);
   else if (key == 's' || key == 'S' || key == ']')
     view_scroll += 40;
+  else if (key == '+' || key == '=')
+    set_view_zoom(view_zoom * 1.2f);
+  else if (key == '-')
+    set_view_zoom(view_zoom / 1.2f);
+  else if (key == '0')
+    set_view_zoom(1.0f);
   else if (key == 27 || key == 'q' || key == 'Q')
     std::exit(0);
   glutPostRedisplay();
@@ -495,6 +629,111 @@ void keyboard_special(int key, int, int)
     view_scroll = std::max(0, view_scroll - 80);
   else if (key == GLUT_KEY_DOWN || key == GLUT_KEY_PAGE_DOWN)
     view_scroll += 80;
+  glutPostRedisplay();
+}
+
+void mouse_wheel(int, int direction, int, int)
+{
+  view_scroll = std::max(0, view_scroll - direction * 60);
+  glutPostRedisplay();
+}
+
+int image_at(int mouse_x, int mouse_y)
+{
+  int viewport_x, viewport_y, viewport_width, viewport_height;
+  GLUI_Master.get_viewport_area(&viewport_x, &viewport_y,
+                                &viewport_width, &viewport_height);
+  const int viewport_top = glutGet(GLUT_WINDOW_HEIGHT) - viewport_y - viewport_height;
+  const int x = mouse_x - viewport_x;
+  const int y = mouse_y - viewport_top;
+  const int frame_left = viewport_width / 25;
+  const int frame_top = viewport_height / 25;
+  const int content_left = frame_left + 10;
+  const int content_top = frame_top + 10;
+  const int content_right = viewport_width - frame_left - 10;
+  const int content_bottom = viewport_height - frame_top - 10;
+  if (x < content_left || x >= content_right ||
+      y < content_top || y >= content_bottom)
+    return -1;
+
+  for (std::size_t i = 0; i < view_blocks.size(); ++i) {
+    const ViewBlock &block = view_blocks[i];
+    if (block.texture && x >= block.draw_x &&
+        x < block.draw_x + block.draw_width &&
+        y >= block.draw_y && y < block.draw_y + block.draw_height)
+      return static_cast<int>(i);
+  }
+  return -1;
+}
+
+void mouse_button(int button, int state, int x, int y)
+{
+  if (button != GLUT_LEFT_BUTTON)
+    return;
+  if (state == GLUT_DOWN) {
+    hovered_image = image_at(x, y);
+    dragging = hovered_image >= 0;
+    last_mouse_x = x;
+    last_mouse_y = y;
+  } else {
+    dragging = false;
+  }
+}
+
+void mouse_motion(int x, int y)
+{
+  if (!dragging)
+    return;
+  view_pan_x -= x - last_mouse_x;
+  view_scroll -= y - last_mouse_y;
+  last_mouse_x = x;
+  last_mouse_y = y;
+  glutPostRedisplay();
+}
+
+void mouse_passive_motion(int x, int y)
+{
+  hovered_image = image_at(x, y);
+}
+
+enum ContextAction {
+  COPY_IMAGE = 1,
+  SHOW_INFO = 2,
+  EXIT_VIEWER = 3
+};
+
+void context_action(int action)
+{
+  if (action == COPY_IMAGE) {
+    if (hovered_image < 0 ||
+        static_cast<std::size_t>(hovered_image) >= view_blocks.size()) {
+#ifdef _WIN32
+      MessageBoxW(NULL, L"Right-click a rendered diagram to copy it.",
+                  L"catmd viewer", MB_OK | MB_ICONINFORMATION);
+#else
+      std::fprintf(stderr, "Right-click a rendered diagram to copy it.\n");
+#endif
+      return;
+    }
+#ifdef _WIN32
+    if (!copy_png_to_clipboard(view_blocks[hovered_image].png))
+      MessageBoxW(NULL, L"Could not copy the diagram to the clipboard.",
+                  L"catmd viewer", MB_OK | MB_ICONWARNING);
+#else
+    std::fprintf(stderr, "Image clipboard export is only available on Windows.\n");
+#endif
+  } else if (action == SHOW_INFO) {
+#ifdef _WIN32
+    MessageBoxW(NULL,
+      L"catmd viewer - release 1.0.0\n\u00a9 Ellie Dawson 2026",
+      L"About catmd viewer", MB_OK | MB_ICONINFORMATION);
+#else
+    std::fprintf(stderr, "catmd viewer - release 1.0.0\n\xC2\xA9 Ellie Dawson 2026\n");
+#endif
+  } else if (action == EXIT_VIEWER) {
+    std::exit(0);
+  }
+  glutSetWindow(main_window);
   glutPostRedisplay();
 }
 
@@ -563,6 +802,7 @@ int main(int argc, char **argv)
   GLUI_Master.set_glutReshapeFunc(reshape);
   GLUI_Master.set_glutKeyboardFunc(keyboard);
   GLUI_Master.set_glutSpecialFunc(keyboard_special);
+  glutMouseWheelFunc(mouse_wheel);
 
 #ifdef _WIN32
   Gdiplus::GdiplusStartupInput gdiplus_input;
@@ -572,7 +812,10 @@ int main(int argc, char **argv)
 
   GLUI *controls = GLUI_Master.create_glui_subwindow(
     main_window, GLUI_SUBWINDOW_RIGHT);
-  new GLUI_StaticText(controls, "Browse and preview a text file");
+  new GLUI_StaticText(controls, "Wheel/arrows scroll; +/- zoom");
+  new GLUI_Button(controls, "Zoom In (+)", 0, zoom_in);
+  new GLUI_Button(controls, "Zoom Out (-)", 0, zoom_out);
+  new GLUI_Button(controls, "Reset Zoom (0)", 0, zoom_reset);
   file_browser = new GLUI_FileBrowser(controls, "Files", GLUI_PANEL_EMBOSSED,
                                       1, file_selected);
   file_browser->set_w(280);
@@ -588,6 +831,18 @@ int main(int argc, char **argv)
     load_file(initial_file);
 
   controls->set_main_gfx_window(main_window);
+  glutSetWindow(main_window);
+  glutKeyboardFunc(keyboard);
+  glutSpecialFunc(keyboard_special);
+  glutMouseFunc(mouse_button);
+  glutMotionFunc(mouse_motion);
+  glutPassiveMotionFunc(mouse_passive_motion);
+  glutMouseWheelFunc(mouse_wheel);
+  context_menu = glutCreateMenu(context_action);
+  glutAddMenuEntry("copy image", COPY_IMAGE);
+  glutAddMenuEntry("info", SHOW_INFO);
+  glutAddMenuEntry("exit", EXIT_VIEWER);
+  glutAttachMenu(GLUT_RIGHT_BUTTON);
 
   glutMainLoop();
   return 0;
