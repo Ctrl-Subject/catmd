@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -38,9 +38,9 @@ beforeAll(async () => {
   await writeFile(samplePath, SAMPLE);
 });
 
-function cli(args: string[]) {
+function cli(args: string[], extraEnv: NodeJS.ProcessEnv = {}) {
   return run(process.execPath, [CLI, ...args], {
-    env: { ...process.env, XDG_CACHE_HOME: cacheDir },
+    env: { ...process.env, XDG_CACHE_HOME: cacheDir, ...extraEnv },
     maxBuffer: 64 * 1024 * 1024,
   });
 }
@@ -79,5 +79,22 @@ describe("cli end-to-end", { timeout: 120_000 }, () => {
     expect(stdout).toContain("```mermaid");
     expect(stdout).toContain("not mermaid !!!");
     expect(stdout).toContain("after");
+  });
+
+  it("viewer launches the native app and forwards an optional file path", async () => {
+    const capturePath = join(dir, "viewer-args.json");
+    const filePath = join(dir, "notes with spaces.mjs");
+    await writeFile(
+      filePath,
+      `import { writeFileSync } from "node:fs"; writeFileSync(process.env.CATMD_TEST_CAPTURE, JSON.stringify(process.argv[1]));`,
+    );
+
+    const { stderr } = await cli(["viewer", filePath], {
+      CATMD_VIEWER: process.execPath,
+      CATMD_TEST_CAPTURE: capturePath,
+    });
+
+    expect(stderr).toBe("");
+    expect(await readFile(capturePath, "utf8")).toBe(JSON.stringify(filePath));
   });
 });

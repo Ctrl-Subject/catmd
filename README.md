@@ -46,11 +46,18 @@ result straight into the terminal with the kitty graphics protocol.
 
 ```
 catmd [options] [file]         # reads stdin when no file is given
+catmd viewer [file]            # open the standalone file viewer
 
 --theme <name>       mermaid theme: default, dark, forest, neutral
 --text-size <n>      diagram text height in terminal rows (default 1.0)
 --force              emit images even when stdout is not a supported TTY
 ```
+
+`catmd viewer` opens the native `catmd-viewer` application, independent of
+terminal graphics support. Build `src/Viewer/Viewer.cpp` with GLUT and GLUI,
+then place the executable beside the installed `catmd` CLI as `catmd-viewer`
+(`catmd-viewer.exe` on Windows), or set `CATMD_VIEWER` to its path. Pass a
+file path to open it in the preview when the viewer starts.
 
 Invalid mermaid prints a warning to stderr and passes the original fence
 through; the rest of the document still renders.

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import { cacheDir, cacheKey } from "./render/cache.js";
 import { Renderer, mermaidConfigJson, rendererVersion } from "./render/renderer.js";
 
 const USAGE = `Usage: catmd [options] [file]
+  catmd viewer [file]
 
 cat markdown, rendering \`\`\`mermaid fences as inline terminal images
 (kitty graphics protocol: Ghostty, kitty). Reads stdin when no file is
@@ -32,6 +34,40 @@ Options:
   --force            emit images even when stdout is not a supported TTY
   -h, --help         show this help
 `;
+
+function launchViewer(file?: string): Promise<number> {
+  const viewerName = process.platform === "win32" ? "catmd-viewer.exe" : "catmd-viewer";
+  const bundledViewer = [
+    join(import.meta.dirname, viewerName),
+    join(import.meta.dirname, "..", "src", "Viewer", viewerName),
+  ].find(existsSync);
+  const executable = process.env.CATMD_VIEWER ??
+    bundledViewer ?? viewerName;
+
+  return new Promise((resolve) => {
+    const child = spawn(executable, file ? [file] : [], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        CATMD_NODE: process.execPath,
+        CATMD_CLI: process.argv[1],
+      },
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        process.stderr.write(
+          `catmd: viewer executable not found; build Viewer.cpp as catmd-viewer or set CATMD_VIEWER\n`,
+        );
+      } else {
+        process.stderr.write(`catmd: could not start viewer: ${error.message}\n`);
+      }
+      resolve(1);
+    });
+    child.once("exit", (code, signal) => {
+      resolve(code ?? (signal ? 1 : 0));
+    });
+  });
+}
 
 async function main(): Promise<number> {
   let args;
@@ -52,6 +88,13 @@ async function main(): Promise<number> {
   if (args.values.help) {
     process.stdout.write(USAGE);
     return 0;
+  }
+  if (args.positionals[0] === "viewer") {
+    if (args.positionals.length > 2) {
+      process.stderr.write(`catmd: viewer accepts at most one file path\n${USAGE}`);
+      return 2;
+    }
+    return launchViewer(args.positionals[1]);
   }
   const textSize = Number(args.values["text-size"]);
   if (!Number.isFinite(textSize) || textSize <= 0) {

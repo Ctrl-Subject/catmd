@@ -29,7 +29,8 @@
     "catmd": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "src/Viewer/catmd-viewer.exe"
   ],
   "engines": {
     "node": ">=22.12"
